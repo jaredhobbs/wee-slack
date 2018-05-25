@@ -790,8 +790,8 @@ def slack_never_away_cb(data, remaining_calls):
 @utf8_decode
 def typing_bar_item_cb(data, current_buffer, args):
     """
-    Privides a bar item indicating who is typing in the current channel AND
-    why is typing a DM to you globally.
+    Provides a bar item indicating who is typing in the current channel AND
+    who is typing a DM to you globally.
     """
     typers = []
     current_buffer = w.current_buffer()
@@ -2001,6 +2001,8 @@ class SlackUser(object):
         if self.profile.get("display_name"):
             self.slack_name = self.profile["display_name"]
             self.name = self.profile["display_name"].replace(' ', '')
+            if config.prefer_real_name:
+                self.name = self.profile.get('real_name', self.name)
         else:
             # No display name set. Fall back to the deprecated username field.
             self.slack_name = kwargs["name"]
@@ -3826,6 +3828,10 @@ class PluginConfig(object):
         'never_away': Setting(
             default='false',
             desc='Poke Slack every five minutes so that it never marks you "away".'),
+        'prefer_real_name': Setting(
+            default='false',
+            desc='Display the real_name instead of the display_name',
+        ),
         'record_events': Setting(
             default='false',
             desc='Log all traffic from Slack to disk as JSON.'),
