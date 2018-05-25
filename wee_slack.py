@@ -72,6 +72,13 @@ SLACK_API_TRANSLATOR = {
         "mark": "groups.mark",
         "info": "groups.info"
     },
+    "shared": {
+        "history": "conversations.history",
+        "join": "conversations.join",
+        "leave": "conversations.leave",
+        "mark": "channels.mark",
+        "info": "conversations.info",
+    },
     "thread": {
         "history": None,
         "join": None,
@@ -122,6 +129,7 @@ def utf8_decode(f):
 
 NICK_GROUP_HERE = "0|Here"
 NICK_GROUP_AWAY = "1|Away"
+NICK_GROUP_EXTERNAL = "2|External"
 
 sslopt_ca_certs = {}
 if hasattr(ssl, "get_default_verify_paths") and callable(ssl.get_default_verify_paths):
@@ -982,6 +990,7 @@ class SlackTeam(object):
         except:
             self.channels = channels
         self.users = users
+        self.external_users = {}
         self.bots = bots
         self.team_hash = SlackTeam.generate_team_hash(self.nick, self.subdomain)
         self.name = self.domain
@@ -1071,6 +1080,9 @@ class SlackTeam(object):
 
     def get_username_map(self):
         return {v.name: k for k, v in self.users.iteritems()}
+
+    def get_user(self, user_id):
+        return self.users.get(user_id, self.external_users.get(user_id))
 
     def get_team_hash(self):
         return self.team_hash
@@ -1249,6 +1261,8 @@ class SlackChannel(object):
             prepend = ">"
         elif self.type == "group":
             prepend = config.group_name_prefix
+        elif self.type == "shared":
+            prepend = config.shared_name_prefix
         else:
             prepend = "#"
         select = {
@@ -1553,7 +1567,7 @@ class SlackChannel(object):
     def update_nicklist(self, user=None):
         if not self.channel_buffer:
             return
-        if self.type not in ["channel", "group", "mpim"]:
+        if self.type not in ["channel", "group", "mpim", "shared"]:
             return
         w.buffer_set(self.channel_buffer, "nicklist", "1")
         # create nicklists for the current channel if they don't exist
@@ -1565,8 +1579,15 @@ class SlackChannel(object):
         if not afk:
             afk = w.nicklist_add_group(self.channel_buffer, '', NICK_GROUP_AWAY, "weechat.color.nicklist_group", 1)
 
+        # Add External nicklist group only for shared channels
+        external = None
+        if self.type == 'shared':
+            external = w.nicklist_search_group(self.channel_buffer, '', NICK_GROUP_EXTERNAL)
+            if not external:
+                external = w.nicklist_add_group(self.channel_buffer, '', NICK_GROUP_EXTERNAL, 'weechat.color.nicklist_group', 2)
+
         if user and len(self.members) < 1000:
-            user = self.team.users[user]
+            user = self.team.get_user(user)
             if user.deleted:
                 return
             nick = w.nicklist_search_nick(self.channel_buffer, "", user.name)
@@ -1574,7 +1595,9 @@ class SlackChannel(object):
             w.nicklist_remove_nick(self.channel_buffer, nick)
             # now add it back in to whichever..
             nick_group = afk
-            if self.team.is_user_present(user.identifier):
+            if user.is_external:
+                nick_group = external
+            elif self.team.is_user_present(user.identifier):
                 nick_group = here
             if user.identifier in self.members:
                 w.nicklist_add_nick(self.channel_buffer, nick_group, user.name, user.color_name, "", "", 1)
@@ -1584,11 +1607,13 @@ class SlackChannel(object):
             if len(self.members) < 1000:
                 try:
                     for user in self.members:
-                        user = self.team.users[user]
+                        user = self.team.get_user(user)
                         if user.deleted:
                             continue
                         nick_group = afk
-                        if self.team.is_user_present(user.identifier):
+                        if user.is_external:
+                            nick_group = external
+                        elif self.team.is_user_present(user.identifier):
                             nick_group = here
                         w.nicklist_add_nick(self.channel_buffer, nick_group, user.name, user.color_name, "", "", 1)
                 except Exception as e:
@@ -1771,6 +1796,36 @@ class SlackMPDMChannel(SlackChannel):
         pass
 
 
+class SlackSharedChannel(SlackChannel):
+    def __init__(self, eventrouter, **kwargs):
+        super(SlackSharedChannel, self).__init__(eventrouter, **kwargs)
+        self.type = 'shared'
+
+    def set_related_server(self, team):
+        super(SlackSharedChannel, self).set_related_server(team)
+        # Fetch members here (after the team is known) since they aren't
+        # included in rtm.start
+        s = SlackRequest(
+            team.token,
+            'conversations.members',
+            {'channel': self.identifier},
+            team_hash=team.team_hash,
+            channel_identifier=self.identifier,
+        )
+        self.eventrouter.receive(s)
+
+    def get_history(self, slow_queue=False):
+        # Get info for external users in the channel
+        all_users = set(self.team.users.keys()) | set(self.team.external_users.keys())
+        for user in self.members - all_users:
+            s = SlackRequest(self.team.token, 'users.info', {'user': user}, team_hash=self.team.team_hash)
+            self.eventrouter.receive(s)
+        super(SlackSharedChannel, self).get_history(slow_queue)
+
+    def set_name(self, slack_name):
+        self.name = config.shared_name_prefix + slack_name
+
+
 class SlackThreadChannel(object):
     """
     A thread channel is a virtual channel. We don't inherit from
@@ -1924,6 +1979,7 @@ class SlackUser(object):
         # the rest we can just learn from slack
         self.identifier = kwargs["id"]
         self.profile = {}  # in case it's not in kwargs
+        self.is_external = False
         for key, value in kwargs.items():
             setattr(self, key, value)
 
@@ -2016,15 +2072,25 @@ class SlackMessage(object):
         dbg(self.message_json)
 
     def get_sender(self):
-        name = ""
-        name_plain = ""
         if 'user' in self.message_json:
             if self.message_json['user'] == self.team.myidentifier:
                 u = self.team.users[self.team.myidentifier]
             elif self.message_json['user'] in self.team.users:
                 u = self.team.users[self.message_json['user']]
+            else:
+                u = self.team.get_user(self.message_json['user'])
+            if u is None and 'user_profile' in self.message_json:
+                user_data = dict(self.message_json)
+                user_data['id'] = user_data['user']
+                user_data['profile'] = user_data['user_profile']
+                user_data['is_external'] = True
+                del user_data['user_profile']
+                u = SlackUser(**user_data)
             name = "{}".format(u.formatted_name())
             name_plain = "{}".format(u.formatted_name(enable_color=False))
+            if u.is_external:
+                name += config.external_user_suffix
+                name_plain += config.external_user_suffix
         elif 'username' in self.message_json:
             u = self.message_json["username"]
             if self.message_json.get("subtype") == "bot_message":
@@ -2132,9 +2198,8 @@ class SlackTS(object):
     def minorstr(self):
         return str(self.minor)
 
+
 ###### New handlers
-
-
 def handle_rtmstart(login_data, eventrouter):
     """
     This handles the main entry call to slack, rtm.start
@@ -2164,9 +2229,14 @@ def handle_rtmstart(login_data, eventrouter):
 
         channels = {}
         for item in login_data["channels"]:
-            channels[item["id"]] = SlackChannel(eventrouter, **item)
+            if item['is_shared']:
+                channels[item['id']] = SlackSharedChannel(eventrouter, **item)
+            else:
+                channels[item["id"]] = SlackChannel(eventrouter, **item)
 
         for item in login_data["ims"]:
+            if item['user'] not in users:
+                continue
             channels[item["id"]] = SlackDMChannel(eventrouter, users, **item)
 
         for item in login_data["groups"]:
@@ -2261,6 +2331,10 @@ def handle_mpimhistory(message_json, eventrouter, **kwargs):
     handle_history(message_json, eventrouter, **kwargs)
 
 
+def handle_conversationshistory(message_json, eventrouter, **kwargs):
+    handle_history(message_json, eventrouter, **kwargs)
+
+
 def handle_history(message_json, eventrouter, **kwargs):
     request_metadata = pickle.loads(message_json["wee_slack_request_metadata"])
     kwargs['team'] = eventrouter.teams[request_metadata.team_hash]
@@ -2275,6 +2349,46 @@ def handle_history(message_json, eventrouter, **kwargs):
         w.buffer_clear(kwargs['channel'].channel_buffer)
     for message in reversed(message_json["messages"]):
         process_message(message, eventrouter, **kwargs)
+
+
+def handle_conversationsmembers(members_json, eventrouter, **kwargs):
+    request_metadata = pickle.loads(members_json['wee_slack_request_metadata'])
+    team = eventrouter.teams[request_metadata.team_hash]
+    channel = team.channels[request_metadata.channel_identifier]
+    channel.members = set(members_json['members'])
+
+
+def handle_usersinfo(user_json, eventrouter, **kwargs):
+    request_metadata = pickle.loads(user_json['wee_slack_request_metadata'])
+    team = eventrouter.teams[request_metadata.team_hash]
+    user_info = user_json['user']
+    user_info['is_external'] = True
+    team.external_users[user_info['id']] = SlackUser(**user_info)
+
+
+###### Unimplemented handlers (defined here to squash debug output)
+def handle_file_shared(*args, **kwargs):
+    pass
+
+
+def handle_file_public(*args, **kwargs):
+    pass
+
+
+def handle_channelsmark(*args, **kwargs):
+    pass
+
+
+def handle_member_joined_channel(*args, **kwargs):
+    pass
+
+
+def handle_conversationsinfo(*args, **kwargs):
+    pass
+
+
+def handle_file_comment_added(*args, **kwargs):
+    pass
 
 
 ###### New/converted process_ and subprocess_ methods
@@ -2835,11 +2949,12 @@ def resolve_ref(ref):
         e = EVENTROUTER
         if ref.startswith('@U') or ref.startswith('@W'):
             for t in e.teams.keys():
-                if ref[1:] in e.teams[t].users:
-                    # try:
-                    return "@{}".format(e.teams[t].users[ref[1:]].name)
-                    # except:
-                    #    dbg("NAME: {}".format(ref))
+                user = e.teams[t].get_user(ref[1:])
+                if user:
+                    name = '@{}'.format(user.name)
+                    if user.is_external:
+                        name += config.external_user_suffix
+                    return name
         elif ref.startswith('#C'):
             for t in e.teams.keys():
                 if ref[1:] in e.teams[t].channels:
@@ -3667,6 +3782,9 @@ class PluginConfig(object):
         'distracting_channels': Setting(
             default='',
             desc='List of channels to hide.'),
+        'external_user_suffix': Setting(
+            default='*',
+            desc='The suffix appended to nicks to indicate external users.'),
         'group_name_prefix': Setting(
             default='&',
             desc='The prefix of buffer names for groups (private channels).'),
@@ -3698,6 +3816,9 @@ class PluginConfig(object):
             ' will be used instead of the actual name of the slack (in buffer'
             ' names, logging, etc). E.g `work:no_fun_allowed` would make your'
             ' work slack show up as `no_fun_allowed` rather than `work.slack.com`.'),
+        'shared_name_prefix': Setting(
+            default='%',
+            desc='The prefix of buffer names for shared channels.'),
         'short_buffer_names': Setting(
             default='false',
             desc='Use `foo.#channel` rather than `foo.slack.com.#channel` as the'
@@ -3797,10 +3918,12 @@ class PluginConfig(object):
         return w.config_get_plugin(key) == default
 
     get_debug_level = get_int
+    get_external_user_suffix = get_string
     get_group_name_prefix = get_string
     get_map_underline_to = get_string
     get_render_bold_as = get_string
     get_render_italic_as = get_string
+    get_shared_name_prefix = get_string
     get_slack_timeout = get_int
     get_thread_suffix_color = get_string
     get_unfurl_auto_link_display = get_string
