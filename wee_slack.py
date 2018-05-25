@@ -1588,7 +1588,7 @@ class SlackChannel(object):
 
         if user and len(self.members) < 1000:
             user = self.team.get_user(user)
-            if user.deleted:
+            if not user or user.deleted:
                 return
             nick = w.nicklist_search_nick(self.channel_buffer, "", user.name)
             # since this is a change just remove it regardless of where it is
@@ -1659,12 +1659,27 @@ class SlackDMChannel(SlackChannel):
 
     def __init__(self, eventrouter, users, **kwargs):
         dmuser = kwargs["user"]
-        kwargs["name"] = users[dmuser].name
+        kwargs["name"] = users[dmuser].name if dmuser in users else dmuser
         super(SlackDMChannel, self).__init__(eventrouter, **kwargs)
         self.type = 'im'
         self.update_color()
         self.set_name(self.slack_name)
-        self.topic = create_user_status_string(users[dmuser].profile)
+        if dmuser in users:
+            self.topic = create_user_status_string(users[dmuser].profile)
+
+    def set_related_server(self, team):
+        super(SlackDMChannel, self).set_related_server(team)
+        # If the topic hasn't been set then the user is external and needs to
+        # be fetched
+        if not self.topic:
+            s = SlackRequest(
+                self.team.token,
+                'users.info',
+                {'user': self.slack_name},
+                team_hash=self.team.team_hash,
+                channel_identifier=self.identifier,
+            )
+            self.eventrouter.receive(s)
 
     def set_name(self, slack_name):
         self.name = slack_name
@@ -2055,6 +2070,15 @@ class SlackMessage(object):
         if message_json.get('subtype') == 'me_message' and not message_json['text'].startswith(self.sender):
             message_json['text'] = self.sender + ' ' + self.message_json['text']
 
+        # Replace Slack link with direct link to shared file (required if
+        # shared by an external user since only the direct link is accessible)
+        if message_json.get('subtype') == 'file_share':
+            message_json['text'] = re.sub(
+                r'<http.+\|',
+                r'<{}|'.format(message_json['file']['url_private']),
+                message_json['text'],
+            )
+
     def __hash__(self):
         return hash(self.ts)
 
@@ -2235,8 +2259,6 @@ def handle_rtmstart(login_data, eventrouter):
                 channels[item["id"]] = SlackChannel(eventrouter, **item)
 
         for item in login_data["ims"]:
-            if item['user'] not in users:
-                continue
             channels[item["id"]] = SlackDMChannel(eventrouter, users, **item)
 
         for item in login_data["groups"]:
@@ -2361,9 +2383,17 @@ def handle_conversationsmembers(members_json, eventrouter, **kwargs):
 def handle_usersinfo(user_json, eventrouter, **kwargs):
     request_metadata = pickle.loads(user_json['wee_slack_request_metadata'])
     team = eventrouter.teams[request_metadata.team_hash]
+    channel = team.channels[request_metadata.channel_identifier]
     user_info = user_json['user']
-    user_info['is_external'] = True
-    team.external_users[user_info['id']] = SlackUser(**user_info)
+    user_info.update(is_external=True, deleted=False)
+    user = SlackUser(**user_info)
+    team.external_users[user_info['id']] = user
+
+    if channel.type == 'shared':
+        channel.update_nicklist(user_info['id'])
+    elif channel.type == 'im':
+        channel.slack_name = user.name
+        channel.set_topic(create_user_status_string(user.profile))
 
 
 ###### Unimplemented handlers (defined here to squash debug output)
