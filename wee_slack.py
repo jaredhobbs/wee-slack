@@ -2001,12 +2001,13 @@ class SlackUser(object):
         if self.profile.get("display_name"):
             self.slack_name = self.profile["display_name"]
             self.name = self.profile["display_name"].replace(' ', '')
-            if config.prefer_real_name:
-                self.name = self.profile.get('real_name', self.name)
         else:
             # No display name set. Fall back to the deprecated username field.
             self.slack_name = kwargs["name"]
             self.name = self.slack_name
+        self.real_name = self.name
+        if config.prefer_real_name:
+            self.real_name = self.profile.get('real_name', self.name)
         self.update_color()
 
     def __repr__(self):
@@ -2028,9 +2029,9 @@ class SlackUser(object):
 
     def formatted_name(self, prepend="", enable_color=True):
         if enable_color:
-            return self.color + prepend + self.name
+            return self.color + prepend + self.real_name
         else:
-            return prepend + self.name
+            return prepend + self.real_name
 
 
 class SlackBot(SlackUser):
