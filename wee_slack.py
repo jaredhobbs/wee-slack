@@ -788,13 +788,12 @@ def slack_never_away_cb(data, remaining_calls):
 
 
 @utf8_decode
-def typing_bar_item_cb(data, current_buffer, args):
+def typing_bar_item_cb(data, item, current_window, current_buffer, extra_info):
     """
     Provides a bar item indicating who is typing in the current channel AND
     who is typing a DM to you globally.
     """
     typers = []
-    current_buffer = w.current_buffer()
     current_channel = EVENTROUTER.weechat_controller.buffers.get(current_buffer, None)
 
     # first look for people typing in this channel
@@ -3701,7 +3700,7 @@ def load_emoji():
 def setup_hooks():
     cmds = {k[8:]: v for k, v in globals().items() if k.startswith("command_")}
 
-    w.bar_item_new('slack_typing_notice', 'typing_bar_item_cb', '')
+    w.bar_item_new('slack_typing_notice', '(extra)typing_bar_item_cb', '')
 
     w.hook_timer(1000, 0, 0, "typing_update_cb", "")
     w.hook_timer(1000, 0, 0, "buffer_list_update_callback", "EVENTROUTER")

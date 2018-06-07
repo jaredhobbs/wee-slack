@@ -39,6 +39,8 @@ Dependencies
 ------------
   * WeeChat 1.3+ http://weechat.org/
   * websocket-client https://pypi.python.org/pypi/websocket-client/
+  * Some distributions package weechat's plugin functionalities in separate packages.
+    Be sure that your weechat supports python plugins. Under Debian, install `weechat-python`
 
 Setup
 ------
@@ -61,6 +63,12 @@ wee-slack doesn't use the Slack IRC gateway. If you currently connect via the ga
 ##### OSX and Linux
 ```
 pip install websocket-client
+```
+
+Note: If you installed weechat with Homebrew, you will have to locate the python runtime environment used.
+If `--with-python@2` was used, you should use:
+```
+sudo /usr/local/opt/python@2/bin/pip2 install websocket_client
 ```
 
 ##### FreeBSD
@@ -247,6 +255,14 @@ To enable tab completion of emojis, copy or symlink the `weemoji.json` file to y
 
 ```
 /set weechat.completion.default_template "%(nicks)|%(irc_channels)|%(emoji)"
+```
+
+Removing a team
+---------------
+
+You may remove a team by removing its token from the dedicated comma-separated list:
+```
+/set plugins.var.python.slack.slack_api_token "xoxp-XXXXXXXX,xoxp-XXXXXXXX"
 ```
 
 Optional settings
