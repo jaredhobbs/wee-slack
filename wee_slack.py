@@ -198,6 +198,46 @@ class WeechatWrapper(object):
         return self.wrap_for_utf8(self.wrapped_class.prnt_date_tags)(buffer, date, tags, message)
 
 
+class ProxyWrapper(object):
+    def __init__(self):
+        self.proxy_name = w.config_string(weechat.config_get('weechat.network.proxy_curl'))
+        self.proxy_string = ""
+        self.proxy_type = ""
+        self.proxy_address = ""
+        self.proxy_port = ""
+        self.proxy_user = ""
+        self.proxy_password = ""
+        self.has_proxy = False
+        
+        if self.proxy_name:
+            self.proxy_string = "weechat.proxy.{}".format(self.proxy_name)
+            self.proxy_type = w.config_string(weechat.config_get("{}.type".format(self.proxy_string)))
+            if self.proxy_type == "http":
+                self.proxy_address = w.config_string(weechat.config_get("{}.address".format(self.proxy_string)))
+                self.proxy_port = w.config_integer(weechat.config_get("{}.port".format(self.proxy_string)))
+                self.proxy_user = w.config_string(weechat.config_get("{}.username".format(self.proxy_string)))
+                self.proxy_password = w.config_string(weechat.config_get("{}.password".format(self.proxy_string)))
+                self.has_proxy = True
+            else:
+                w.prnt("", "\nWarning: weechat.network.proxy_curl is set to {} type (name : {}, conf string : {}). Only HTTP proxy is supported.\n\n".format(self.proxy_type, self.proxy_name, self.proxy_string))
+        
+    def curl(self):
+        if not self.has_proxy:
+            return ""
+        
+        if self.proxy_user and self.proxy_password:
+            user = "{}:{}@".format(self.proxy_user, self.proxy_password)
+        else:
+            user = ""
+                    
+        if self.proxy_port:
+            port = ":{}".format(self.proxy_port)
+        else:
+            port = ""
+                
+        return "--proxy {}{}{}".format(user, self.proxy_address, port)
+
+
 ##### Helpers
 
 def get_nick_color_name(nick):
@@ -504,7 +544,7 @@ class EventRouter(object):
                     elif function_name in self.handlers:
                         self.handlers[function_name](j, self, **kwargs)
                     else:
-                        raise ProcessNotImplemented(function_name)
+                        dbg("Callback not implemented for event: {}".format(function_name))
 
 
 def handle_next(*args):
@@ -1114,7 +1154,13 @@ class SlackTeam(object):
             self.connecting = True
             if self.ws_url:
                 try:
-                    ws = create_connection(self.ws_url, sslopt=sslopt_ca_certs)
+                    # only http proxy is currently supported
+                    proxy = ProxyWrapper()
+                    if proxy.has_proxy == True:
+                        ws = create_connection(self.ws_url, sslopt=sslopt_ca_certs, http_proxy_host=proxy.proxy_address, http_proxy_port=proxy.proxy_port, http_proxy_auth=(proxy.proxy_user, proxy.proxy_password))
+                    else:
+                        ws = create_connection(self.ws_url, sslopt=sslopt_ca_certs)
+
                     self.hook = w.hook_fd(ws.sock._sock.fileno(), 1, 0, 0, "receive_ws_callback", self.get_team_hash())
                     ws.sock.setblocking(0)
                     self.ws = ws
@@ -1214,6 +1260,7 @@ class SlackChannel(object):
         self.current_short_name = self.name
         self.set_members(kwargs.get('members', []))
         self.unread_count_display = 0
+        self.last_line_from = None
 
     def __eq__(self, compare_str):
         if compare_str == self.slack_name or compare_str == self.formatted_name() or compare_str == self.formatted_name(style="long_default"):
@@ -1374,7 +1421,8 @@ class SlackChannel(object):
             self.eventrouter.receive(s)
 
     def buffer_prnt(self, nick, text, timestamp=str(time.time()), tagset=None, tag_nick=None, **kwargs):
-        data = "{}\t{}".format(format_nick(nick), text)
+        data = "{}\t{}".format(format_nick(nick, self.last_line_from), text)
+        self.last_line_from = nick
         ts = SlackTS(timestamp)
         last_read = SlackTS(self.last_read)
         # without this, DMs won't open automatically
@@ -1857,6 +1905,7 @@ class SlackThreadChannel(object):
         self.label = None
         self.members = self.parent_message.channel.members
         self.team = self.parent_message.team
+        self.last_line_from = None
         # self.set_name(self.slack_name)
     # def set_name(self, slack_name):
     #    self.name = "#" + slack_name
@@ -1879,7 +1928,8 @@ class SlackThreadChannel(object):
             w.buffer_set(self.channel_buffer, "hotlist", "-1")
 
     def buffer_prnt(self, nick, text, timestamp, **kwargs):
-        data = "{}\t{}".format(format_nick(nick), text)
+        data = "{}\t{}".format(format_nick(nick, self.last_line_from), text)
+        self.last_line_from = nick
         ts = SlackTS(timestamp)
         if self.channel_buffer:
             # backlog messages - we will update the read marker as we print these
@@ -2959,6 +3009,11 @@ def unwrap_attachments(message_json, text_before):
                 tx = re.sub(r' *\n[\n ]+', '\n', atext)
                 t.append(prepend_title_text + tx)
                 prepend_title_text = ''
+
+            image_url = attachment.get('image_url', '')
+            if image_url not in text_before_unescaped and image_url != title_link:
+                t.append(image_url)
+
             fields = attachment.get("fields", None)
             if fields:
                 for f in fields:
@@ -3113,7 +3168,9 @@ def modify_print_time(buffer, new_id, time):
     return w.WEECHAT_RC_OK
 
 
-def format_nick(nick):
+def format_nick(nick, previous_nick=None):
+    if nick == previous_nick:
+        nick = w.config_string(w.config_get('weechat.look.prefix_same_nick')) or nick
     nick_prefix = w.config_string(w.config_get('weechat.look.nick_prefix'))
     nick_prefix_color_name = w.config_string(w.config_get('weechat.color.chat_nick_prefix'))
     nick_prefix_color = w.color(nick_prefix_color_name)
@@ -3282,12 +3339,27 @@ def command_register(data, current_buffer, args):
         "https://slack.com/api/oauth.access?"
         "client_id={}&client_secret={}&code={}"
     ).format(CLIENT_ID, CLIENT_SECRET, oauth_code)
-    ret = urllib.urlopen(uri).read()
-    d = json.loads(ret)
+    params = {'useragent': 'wee_slack {}'.format(SCRIPT_VERSION)}
+    w.hook_process_hashtable('url:', params, config.slack_timeout, "", "")
+    w.hook_process_hashtable("url:{}".format(uri), params, config.slack_timeout, "command_register_callback", "")
+
+@utf8_decode
+def command_register_callback(data, command, return_code, out, err):
+    if return_code != 0:
+        w.prnt("", "ERROR: problem when trying to get Slack OAuth token. Got return code {}. Err: ".format(return_code, err))
+        w.prnt("", "Check the network or proxy settings")
+        return w.WEECHAT_RC_OK_EAT
+    
+    if len(out) <= 0:
+        w.prnt("", "ERROR: problem when trying to get Slack OAuth token. Got 0 length answer. Err: ".format(err))
+        w.prnt("", "Check the network or proxy settings")
+        return w.WEECHAT_RC_OK_EAT
+
+    d = json.loads(out)
     if not d["ok"]:
         w.prnt("",
                "ERROR: Couldn't get Slack OAuth token: {}".format(d['error']))
-        return
+        return w.WEECHAT_RC_OK_EAT
 
     if config.is_default('slack_api_token'):
         w.config_set_plugin('slack_api_token', d['access_token'])
@@ -3299,6 +3371,7 @@ def command_register(data, current_buffer, args):
 
     w.prnt("", "Success! Added team \"%s\"" % (d['team_name'],))
     w.prnt("", "Please reload wee-slack with: /python reload slack")
+    return w.WEECHAT_RC_OK_EAT
 
 
 @slack_buffer_or_ignore
@@ -3560,9 +3633,11 @@ def command_upload(data, current_buffer, args):
     if ' ' in file_path:
         file_path = file_path.replace(' ', '\ ')
 
-    command = 'curl -F file=@{} -F channels={} -F token={} {}'.format(file_path, channel.identifier, team.token, url)
+    # only http proxy is currenlty supported
+    proxy = ProxyWrapper()
+    proxy_string = proxy.curl()
+    command = 'curl -F file=@{} -F channels={} -F token={} {} {}'.format(file_path, channel.identifier, team.token, proxy_string, url)
     w.hook_process(command, config.slack_timeout, '', '')
-
 
 @utf8_decode
 def away_command_cb(data, current_buffer, args):
@@ -3649,15 +3724,6 @@ def command_p(data, current_buffer, args):
     w.prnt("", "{}".format(eval(args)))
 
 ###### NEW EXCEPTIONS
-
-
-class ProcessNotImplemented(Exception):
-    """
-    Raised when we try to call process_(something), but
-    (something) has not been defined as a function.
-    """
-    def __init__(self, function_name):
-        super(ProcessNotImplemented, self).__init__(function_name)
 
 
 class InvalidType(Exception):
